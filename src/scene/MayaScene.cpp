@@ -13,6 +13,7 @@
 #include <maya/MFnDagNode.h>
 #include <maya/MFnDependencyNode.h>
 #include <maya/MFnIkJoint.h>
+#include <maya/MFnMatrixData.h>
 #include <maya/MFnMesh.h>
 #include <maya/MFnSingleIndexedComponent.h>
 #include <maya/MFnSkinCluster.h>
@@ -478,6 +479,27 @@ private:
             }
         }
         sc.setWeights(meshDag, componentForAllVertices(numVerts), columns, weights, true);
+
+        // skinCluster -tsb derives bind matrices from the joints' current
+        // transforms, which assumes the rig sits at its bind pose. When the
+        // source posed the joints, override bindPreMatrix with the file's
+        // inverse-bind matrices so the mesh deforms to that pose instead of
+        // snapping back to bind.
+        if (!skin.inverseBind.empty()) {
+            MFnDependencyNode scDep(scObj);
+            MPlug bindPre = scDep.findPlug("bindPreMatrix", false);
+            for (const auto& [slot, column] : slotToColumn) {
+                if (slot < 0 || slot >= int(skin.inverseBind.size())) continue;
+                unsigned idx = sc.indexForInfluenceObject(nodePaths_[skin.joints[slot]]);
+                const ir::Mat4& ib = skin.inverseBind[slot];
+                double d[4][4];
+                for (int r = 0; r < 4; ++r)
+                    for (int c = 0; c < 4; ++c) d[r][c] = ib[r * 4 + c];
+                MFnMatrixData md;
+                MObject mo = md.create(MMatrix(d));
+                bindPre.elementByLogicalIndex(idx).setValue(mo);
+            }
+        }
     }
 
     void applyAnimations() {
@@ -575,23 +597,11 @@ public:
         std::unordered_map<unsigned int, int> jointNodeIndex; // joint MObject hash -> doc node
         collectJoints(joints, jointNodeIndex, doc);
 
-        int skinIndex = -1;
-        if (!joints.empty()) {
-            ir::Skin skin;
-            skin.name = "skin";
-            for (size_t i = 0; i < joints.size(); ++i) {
-                skin.joints.push_back(int(i)); // joint doc-node indices are 0..N-1
-                MMatrix inv = joints[i].inclusiveMatrixInverse();
-                ir::Mat4 m{};
-                for (int r = 0; r < 4; ++r)
-                    for (int c = 0; c < 4; ++c) m[r * 4 + c] = inv(r, c);
-                skin.inverseBind.push_back(m);
-            }
-            doc.skins.push_back(std::move(skin));
-            skinIndex = 0;
-        }
-
-        collectMeshes(doc, joints, jointNodeIndex, skinIndex);
+        // Each skinCluster becomes its own glTF skin. Sharing one global skin
+        // breaks when a joint is bound at different poses by different clusters
+        // (e.g. a weapon base and an attachment), because a joint can then hold
+        // only one inverse-bind matrix. Per-mesh skins keep each binding exact.
+        collectMeshes(doc, jointNodeIndex);
 
         if (exportAnimation && !joints.empty()) sampleAnimation(doc, joints);
 
@@ -648,9 +658,8 @@ private:
         return world;
     }
 
-    void collectMeshes(ir::Document& doc, const std::vector<MDagPath>& joints,
-                       const std::unordered_map<unsigned int, int>& jointNodeIndex,
-                       int skinIndex) const {
+    void collectMeshes(ir::Document& doc,
+                       const std::unordered_map<unsigned int, int>& jointNodeIndex) const {
         MItDag it(MItDag::kDepthFirst, MFn::kMesh);
         std::set<unsigned int> seen;
         for (; !it.isDone(); it.next()) {
@@ -661,9 +670,9 @@ private:
             if (!seen.insert(MObjectHandle(dag.node()).hashCode()).second) continue;
 
             ir::Mesh mesh;
-            mesh.name = shortName(MFnDagNode(dag).partialPathName());
+            mesh.name = shortName(dagFn.partialPathName());
             ir::Primitive prim;
-            buildPrimitive(dag, joints, jointNodeIndex, prim, doc);
+            int skinIndex = buildPrimitive(dag, jointNodeIndex, prim, doc);
             if (prim.vertices.empty()) continue;
             mesh.primitives.push_back(std::move(prim));
 
@@ -671,16 +680,52 @@ private:
             doc.meshes.push_back(std::move(mesh));
 
             ir::Node node;
-            node.name = shortName(MFnDagNode(dag).partialPathName());
+            node.name = shortName(dagFn.partialPathName());
             node.mesh = meshIndex;
-            if (skinIndex >= 0 && prim_hasSkin(doc.meshes[meshIndex])) node.skin = skinIndex;
+            node.skin = skinIndex;
             doc.nodes.push_back(std::move(node));
         }
     }
 
-    static bool prim_hasSkin(const ir::Mesh& mesh) {
-        return !mesh.primitives.empty() && !mesh.primitives[0].vertices.empty() &&
-               mesh.primitives[0].vertices[0].hasSkin;
+    // Builds one glTF skin per skinCluster. The skin's inverse-bind matrices are
+    // taken straight from the cluster's bindPreMatrix (which is exactly glTF's
+    // inverse bind matrix), and JOINTS_0 indices are local slots into this
+    // skin's joint list. Returns the skin index, or -1 when the mesh is rigid.
+    int buildSkin(const MObject& skinObj, MFnSkinCluster& skin, MDagPathArray& influences,
+                  std::vector<int>& influenceSlot,
+                  const std::unordered_map<unsigned int, int>& jointNodeIndex,
+                  ir::Document& doc) const {
+        skin.setObject(skinObj);
+        skin.influenceObjects(influences);
+        MFnDependencyNode dep(skinObj);
+        MPlug bindPre = dep.findPlug("bindPreMatrix", false);
+
+        ir::Skin s;
+        s.name = shortName(dep.name());
+        influenceSlot.assign(influences.length(), -1);
+        for (unsigned i = 0; i < influences.length(); ++i) {
+            auto it = jointNodeIndex.find(MObjectHandle(influences[i].node()).hashCode());
+            if (it == jointNodeIndex.end()) continue; // non-joint influence: unsupported, skip
+            influenceSlot[i] = int(s.joints.size());
+            s.joints.push_back(it->second);
+
+            unsigned idx = skin.indexForInfluenceObject(influences[i]);
+            MPlug elem = bindPre.elementByLogicalIndex(idx);
+            MObject data = elem.asMObject();
+            MMatrix inv;
+            if (!data.isNull())
+                inv = MFnMatrixData(data).matrix();
+            else
+                inv = influences[i].inclusiveMatrixInverse();
+            ir::Mat4 m{};
+            for (int r = 0; r < 4; ++r)
+                for (int c = 0; c < 4; ++c) m[r * 4 + c] = inv(r, c);
+            s.inverseBind.push_back(m);
+        }
+        if (s.joints.empty()) return -1;
+        int index = int(doc.skins.size());
+        doc.skins.push_back(std::move(s));
+        return index;
     }
 
     // A skinCluster's visible output mesh carries normals recomputed from the
@@ -703,22 +748,16 @@ private:
         return outputShape;
     }
 
-    void buildPrimitive(const MDagPath& dag, const std::vector<MDagPath>& joints,
-                        const std::unordered_map<unsigned int, int>& jointNodeIndex,
-                        ir::Primitive& prim, ir::Document& doc) const {
+    int buildPrimitive(const MDagPath& dag,
+                       const std::unordered_map<unsigned int, int>& jointNodeIndex,
+                       ir::Primitive& prim, ir::Document& doc) const {
         MObject skinObj = findSkinCluster(dag);
         MFnSkinCluster skin;
         MDagPathArray influences;
-        std::vector<int> influenceSlot; // influence index -> skin.joints slot
-        if (!skinObj.isNull()) {
-            skin.setObject(skinObj);
-            skin.influenceObjects(influences);
-            influenceSlot.resize(influences.length(), -1);
-            for (unsigned i = 0; i < influences.length(); ++i) {
-                auto it = jointNodeIndex.find(MObjectHandle(influences[i].node()).hashCode());
-                if (it != jointNodeIndex.end()) influenceSlot[i] = it->second;
-            }
-        }
+        std::vector<int> influenceSlot; // influence index -> this skin's joint slot
+        int skinIndex = -1;
+        if (!skinObj.isNull())
+            skinIndex = buildSkin(skinObj, skin, influences, influenceSlot, jointNodeIndex, doc);
 
         MDagPath geomDag = skinObj.isNull() ? dag : geometrySource(dag);
         MFnMesh fnMesh(geomDag);
@@ -730,13 +769,17 @@ private:
         MFnMesh(dag).getConnectedShaders(dag.instanceNumber(), shaders, shaderIndices);
         prim.material = registerMaterial(shaders, doc);
 
+        // Read geometry in world space. The exported mesh node is identity and
+        // glTF skinning ignores the mesh node transform, so bind-world positions
+        // are what `jointGlobal * inverseBind * position` must consume — and for
+        // unskinned meshes world space keeps them where the scene places them.
         prim.vertices.resize(numVertices);
         MPointArray points;
-        fnMesh.getPoints(points, MSpace::kObject);
+        fnMesh.getPoints(points, MSpace::kWorld);
         for (int v = 0; v < numVertices; ++v) {
             ir::Vertex& vert = prim.vertices[v];
             vert.position = {points[v].x, points[v].y, points[v].z};
-            if (!skinObj.isNull()) applyVertexWeights(skin, dag, influences, influenceSlot, v, vert);
+            if (skinIndex >= 0) applyVertexWeights(skin, dag, influences, influenceSlot, v, vert);
         }
 
         // Normals and UVs are stored per face-vertex in Maya. The source asset
@@ -750,7 +793,7 @@ private:
             for (unsigned c = 0; c < faceVerts.length(); ++c) {
                 int vid = faceVerts[c];
                 MVector n;
-                poly.getNormal(c, n, MSpace::kObject);
+                poly.getNormal(c, n, MSpace::kWorld);
                 prim.vertices[vid].normal = {n.x, n.y, n.z};
                 prim.vertices[vid].hasNormal = true;
                 if (poly.hasUVs()) {
@@ -765,6 +808,7 @@ private:
             poly.getTriangles(triPoints, triVerts);
             for (unsigned i = 0; i < triVerts.length(); ++i) prim.indices.push_back(triVerts[i]);
         }
+        return skinIndex;
     }
 
     void applyVertexWeights(MFnSkinCluster& skin, const MDagPath& dag,
@@ -798,15 +842,30 @@ private:
 
     int registerMaterial(const MObjectArray& shaders, ir::Document& doc) const {
         if (shaders.length() == 0) return -1;
-        MFnDependencyNode sg(shaders[0]);
+        // getConnectedShaders returns shading engines; the material name the
+        // user sees is the surface shader wired into the group, not the group
+        // node itself (whose name is often unrelated).
+        std::string name = surfaceShaderName(shaders[0]);
+        if (name.empty()) return -1;
+        for (size_t i = 0; i < doc.materials.size(); ++i)
+            if (doc.materials[i].name == name) return int(i);
         ir::Material mat;
-        mat.name = shortName(sg.name());
-        // Strip the "SG" suffix Maya appends to shading groups for a cleaner name.
-        if (mat.name.size() > 2 && mat.name.compare(mat.name.size() - 2, 2, "SG") == 0)
-            mat.name.resize(mat.name.size() - 2);
+        mat.name = name;
         int index = int(doc.materials.size());
         doc.materials.push_back(std::move(mat));
         return index;
+    }
+
+    static std::string surfaceShaderName(const MObject& shadingEngine) {
+        MFnDependencyNode sg(shadingEngine);
+        MStatus st;
+        MPlug ss = sg.findPlug("surfaceShader", false, &st);
+        if (st == MS::kSuccess) {
+            MPlugArray srcs;
+            ss.connectedTo(srcs, true, false);
+            if (srcs.length() > 0) return shortName(MFnDependencyNode(srcs[0].node()).name());
+        }
+        return shortName(sg.name());
     }
 
     void sampleAnimation(ir::Document& doc, const std::vector<MDagPath>& joints) const {

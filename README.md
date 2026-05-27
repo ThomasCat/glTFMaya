@@ -11,7 +11,7 @@ Supports Autodesk Maya 2019 through 2027 on Windows (x64).
 
 ## Installation
 
-1. Go to the [Releases page](https://github.com/ThomasCat/glTFMaya/releases/tag/latest) and download the zip that matches your Maya version (e.g. `GLTFMaya-Maya2024-Release.zip`).
+1. Go to the [Releases page](https://github.com/ThomasCat/glTFMaya/releases) and download the zip that matches your Maya version (e.g. `GLTFMaya-Maya2024-Release.zip`).
 2. Extract the zip. Inside you will find `GLTFMaya.mll`.
 3. Copy `GLTFMaya.mll` into Maya's plug-in folder:
    - `C:\Program Files\Autodesk\Maya<version>\bin\plug-ins\`
