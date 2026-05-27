@@ -43,6 +43,7 @@
 #include <set>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace gltfmaya::scene {
@@ -394,16 +395,23 @@ private:
                 sg);
             MGlobal::executeCommand(MString("connectAttr -f ") + shader + ".outColor " + sg +
                                     ".surfaceShader");
-            for (int face : faces) {
-                MString cmd = "sets -e -forceElement ";
-                cmd += sg;
+            // `faces` is ascending (built in face order). Collapse runs of
+            // consecutive faces into f[a:b] components and assign them all in
+            // one `sets` call. Issuing one command per face turns import into
+            // thousands of MEL round-trips and dominates load time.
+            MString cmd = MString("sets -e -forceElement ") + sg;
+            for (size_t i = 0; i < faces.size();) {
+                size_t j = i;
+                while (j + 1 < faces.size() && faces[j + 1] == faces[j] + 1) ++j;
                 cmd += " \"";
                 cmd += meshPath.c_str();
                 cmd += ".f[";
-                cmd += face;
+                cmd += faces[i];
+                if (j > i) { cmd += ":"; cmd += faces[j]; }
                 cmd += "]\"";
-                MGlobal::executeCommand(cmd);
+                i = j + 1;
             }
+            MGlobal::executeCommand(cmd);
         }
     }
 
@@ -590,18 +598,40 @@ private:
 
 class Exporter {
 public:
-    MStatus run(ir::Document& doc, bool exportAnimation, std::string& error) const {
+    using NodeSet = std::unordered_set<unsigned int>;
+
+    MStatus run(ir::Document& doc, bool exportAnimation, bool exportSelected,
+                std::string& error) const {
         doc = ir::Document{};
+
+        // When exporting the active selection, restrict traversal to the
+        // selected nodes and their descendants. Without this the MItDag walks
+        // below collect the whole scene regardless of selection.
+        NodeSet allowed;
+        const NodeSet* filter = nullptr;
+        if (exportSelected) {
+            if (!buildSelectionFilter(allowed)) {
+                error = "Nothing selected to export.";
+                return MS::kFailure;
+            }
+            filter = &allowed;
+        }
 
         std::vector<MDagPath> joints;
         std::unordered_map<unsigned int, int> jointNodeIndex; // joint MObject hash -> doc node
-        collectJoints(joints, jointNodeIndex, doc);
+        collectJoints(joints, jointNodeIndex, doc, filter);
 
         // Each skinCluster becomes its own glTF skin. Sharing one global skin
         // breaks when a joint is bound at different poses by different clusters
         // (e.g. a weapon base and an attachment), because a joint can then hold
         // only one inverse-bind matrix. Per-mesh skins keep each binding exact.
-        collectMeshes(doc, jointNodeIndex);
+        collectMeshes(doc, jointNodeIndex, filter);
+
+        // glTF flags a node as a joint only by its presence in some skin's
+        // joints list. Joints that no skinCluster binds (end joints, helper
+        // bones) are otherwise dropped from every skin and reimport as plain
+        // transforms, so make sure each one is still listed.
+        ensureAllJointsExported(doc, joints);
 
         if (exportAnimation && !joints.empty()) sampleAnimation(doc, joints);
 
@@ -616,14 +646,55 @@ public:
     }
 
 private:
+    // Collects the active selection plus every descendant into a node-hash set.
+    // Also pulls in the influence joints (and their joint-parent chains) of any
+    // selected skinned mesh, so a selected mesh still exports with a complete,
+    // connected skeleton even when the joints themselves weren't selected.
+    bool buildSelectionFilter(NodeSet& allowed) const {
+        MSelectionList sel;
+        MGlobal::getActiveSelectionList(sel);
+        for (unsigned i = 0; i < sel.length(); ++i) {
+            MDagPath root;
+            if (sel.getDagPath(i, root) != MS::kSuccess) continue;
+            MItDag it;
+            it.reset(root, MItDag::kDepthFirst);
+            for (; !it.isDone(); it.next()) {
+                MDagPath p;
+                if (it.getPath(p) == MS::kSuccess)
+                    allowed.insert(MObjectHandle(p.node()).hashCode());
+            }
+        }
+        if (allowed.empty()) return false;
+
+        MItDag meshIt(MItDag::kDepthFirst, MFn::kMesh);
+        for (; !meshIt.isDone(); meshIt.next()) {
+            MDagPath dag;
+            if (meshIt.getPath(dag) != MS::kSuccess) continue;
+            if (!allowed.count(MObjectHandle(dag.node()).hashCode())) continue;
+            MObject skinObj = findSkinCluster(dag);
+            if (skinObj.isNull()) continue;
+            MDagPathArray infl;
+            MFnSkinCluster(skinObj).influenceObjects(infl);
+            for (unsigned i = 0; i < infl.length(); ++i) {
+                MDagPath j = infl[i];
+                while (j.length() > 0 && j.hasFn(MFn::kJoint)) {
+                    allowed.insert(MObjectHandle(j.node()).hashCode());
+                    if (j.pop() != MS::kSuccess) break;
+                }
+            }
+        }
+        return true;
+    }
+
     void collectJoints(std::vector<MDagPath>& joints,
                        std::unordered_map<unsigned int, int>& jointNodeIndex,
-                       ir::Document& doc) const {
+                       ir::Document& doc, const NodeSet* filter) const {
         MItDag it(MItDag::kDepthFirst, MFn::kJoint);
         std::unordered_map<unsigned int, int> pathToIndex;
         for (; !it.isDone(); it.next()) {
             MDagPath path;
             if (it.getPath(path) != MS::kSuccess) continue;
+            if (filter && !filter->count(MObjectHandle(path.node()).hashCode())) continue;
             MFnIkJoint fn(path);
             ir::Node node;
             node.name = shortName(fn.partialPathName());
@@ -658,13 +729,49 @@ private:
         return world;
     }
 
+    // collectJoints pushes joint nodes first, so joints[i] is doc node i.
+    void ensureAllJointsExported(ir::Document& doc, const std::vector<MDagPath>& joints) const {
+        if (joints.empty()) return;
+
+        std::set<int> inSkin;
+        for (const auto& s : doc.skins)
+            for (int j : s.joints) inSkin.insert(j);
+
+        std::vector<int> missing;
+        for (size_t i = 0; i < joints.size(); ++i)
+            if (!inSkin.count(int(i))) missing.push_back(int(i));
+        if (missing.empty()) return;
+
+        bool freshSkin = doc.skins.empty();
+        if (freshSkin) {
+            ir::Skin skel;
+            skel.name = "skeleton";
+            doc.skins.push_back(std::move(skel));
+        }
+        ir::Skin& s = doc.skins.front();
+        // Keep inverseBind parallel to joints: append matrices only when the
+        // target skin already carries them (a bound skin always does).
+        bool needInverse = freshSkin || !s.inverseBind.empty();
+        for (int idx : missing) {
+            s.joints.push_back(idx);
+            if (!needInverse) continue;
+            MMatrix inv = joints[idx].inclusiveMatrixInverse();
+            ir::Mat4 m{};
+            for (int r = 0; r < 4; ++r)
+                for (int c = 0; c < 4; ++c) m[r * 4 + c] = inv(r, c);
+            s.inverseBind.push_back(m);
+        }
+    }
+
     void collectMeshes(ir::Document& doc,
-                       const std::unordered_map<unsigned int, int>& jointNodeIndex) const {
+                       const std::unordered_map<unsigned int, int>& jointNodeIndex,
+                       const NodeSet* filter) const {
         MItDag it(MItDag::kDepthFirst, MFn::kMesh);
         std::set<unsigned int> seen;
         for (; !it.isDone(); it.next()) {
             MDagPath dag;
             if (it.getPath(dag) != MS::kSuccess) continue;
+            if (filter && !filter->count(MObjectHandle(dag.node()).hashCode())) continue;
             MFnDagNode dagFn(dag);
             if (dagFn.isIntermediateObject()) continue;
             if (!seen.insert(MObjectHandle(dag.node()).hashCode()).second) continue;
@@ -926,9 +1033,10 @@ MStatus MayaScene::importDocument(const ir::Document& doc) {
     return importer.run();
 }
 
-MStatus MayaScene::exportDocument(ir::Document& doc, bool exportAnimation, std::string& error) const {
+MStatus MayaScene::exportDocument(ir::Document& doc, bool exportAnimation, bool exportSelected,
+                                  std::string& error) const {
     Exporter exporter;
-    return exporter.run(doc, exportAnimation, error);
+    return exporter.run(doc, exportAnimation, exportSelected, error);
 }
 
 } // namespace gltfmaya::scene

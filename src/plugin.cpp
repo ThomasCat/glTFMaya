@@ -6,7 +6,7 @@
 namespace {
 
 const char* kVendor = "Luke Loughlin";
-const char* kVersion = "1.0";
+const char* kVersion = "1.1";
 const char* kGltfTranslator = "glTF";
 const char* kGlbTranslator = "glTF Binary";
 

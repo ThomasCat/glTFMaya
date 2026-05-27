@@ -50,12 +50,11 @@ MStatus GltfTranslatorBase::writer(const MFileObject& file, const MString& optio
                                    FileAccessMode mode) {
     const bool exportAnimation = optionBool(options, "exportAnimation", false);
     const bool exportSelected = (mode == kExportActiveAccessMode);
-    (void)exportSelected;
 
     scene::MayaScene maya;
     ir::Document doc;
     std::string error;
-    if (maya.exportDocument(doc, exportAnimation, error) != MS::kSuccess) {
+    if (maya.exportDocument(doc, exportAnimation, exportSelected, error) != MS::kSuccess) {
         MGlobal::displayError(MString("[GLTFMaya] ") + error.c_str());
         return MS::kFailure;
     }

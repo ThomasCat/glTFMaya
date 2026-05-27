@@ -13,7 +13,8 @@ namespace gltfmaya::scene {
 class MayaScene {
 public:
     MStatus importDocument(const ir::Document& doc);
-    MStatus exportDocument(ir::Document& doc, bool exportAnimation, std::string& error) const;
+    MStatus exportDocument(ir::Document& doc, bool exportAnimation, bool exportSelected,
+                           std::string& error) const;
 };
 
 } // namespace gltfmaya::scene
