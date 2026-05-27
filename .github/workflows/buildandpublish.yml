@@ -1,4 +1,4 @@
-name: Build Plugin for all supported Maya versions
+name: Build Plugin for all supported Autodesk Maya versions
 
 on:
   workflow_dispatch:
