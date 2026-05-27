@@ -1,0 +1,12 @@
+bin/
+obj/
+reference/
+__pycache__/
+docs/
+tests/
+.vs/
+*.vcxproj.user
+*.7z
+*.zip
+*.pyc
+*.json

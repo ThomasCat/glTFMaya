@@ -1,0 +1,169 @@
+name: Build Plugin for all supported Maya versions
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  BUILD_CONFIGURATION: Release
+  BUILD_PLATFORM: x64
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    name: Maya ${{ matrix.maya_version }}
+    runs-on: windows-2022
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - maya_version: "2019"
+            devkit_url_secret: MAYA_2019_DEVKIT_URL
+          - maya_version: "2020"
+            devkit_url_secret: MAYA_2020_DEVKIT_URL
+          - maya_version: "2022"
+            devkit_url_secret: MAYA_2022_DEVKIT_URL
+          - maya_version: "2023"
+            devkit_url_secret: MAYA_2023_DEVKIT_URL
+          - maya_version: "2024"
+            devkit_url_secret: MAYA_2024_DEVKIT_URL
+          - maya_version: "2025"
+            devkit_url_secret: MAYA_2025_DEVKIT_URL
+          - maya_version: "2026"
+            devkit_url_secret: MAYA_2026_DEVKIT_URL
+          - maya_version: "2027"
+            devkit_url_secret: MAYA_2027_DEVKIT_URL
+
+    env:
+      DEVKIT_DIR: ${{ github.workspace }}\_deps\maya-${{ matrix.maya_version }}-devkit
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          token: ${{ github.token }}
+
+      - name: Add MSBuild to PATH
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $msbuild = & $vswhere -latest -requires Microsoft.Component.MSBuild -find "MSBuild\Current\Bin\MSBuild.exe" | Select-Object -First 1
+          if ([string]::IsNullOrWhiteSpace($msbuild)) {
+            throw "MSBuild.exe was not found on this runner."
+          }
+
+          Split-Path $msbuild | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Write-Host "Using MSBuild at $msbuild"
+
+      - name: Download Maya ${{ matrix.maya_version }} devkit
+        shell: pwsh
+        env:
+          MAYA_DEVKIT_URL: ${{ secrets[matrix.devkit_url_secret] }}
+          DEVKIT_URL_SECRET_NAME: ${{ matrix.devkit_url_secret }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:MAYA_DEVKIT_URL)) {
+            throw "Set the $env:DEVKIT_URL_SECRET_NAME repository secret to the official Autodesk Maya devkit .zip URL."
+          }
+
+          New-Item -ItemType Directory -Force -Path "$env:DEVKIT_DIR" | Out-Null
+          $archive = Join-Path $env:RUNNER_TEMP "maya-devkit.zip"
+
+          Invoke-WebRequest -Uri $env:MAYA_DEVKIT_URL -OutFile $archive
+          Expand-Archive -Path $archive -DestinationPath "$env:DEVKIT_DIR" -Force
+
+      - name: Normalize devkit layout
+        shell: pwsh
+        run: |
+          $root = Get-ChildItem -Path "$env:DEVKIT_DIR" -Directory |
+            Where-Object { (Test-Path (Join-Path $_.FullName "include")) -and (Test-Path (Join-Path $_.FullName "lib")) } |
+            Select-Object -First 1
+
+          if ($root) {
+            "MAYA_ROOT=$($root.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          } else {
+            "MAYA_ROOT=$env:DEVKIT_DIR" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+
+      - name: Build
+        shell: pwsh
+        run: |
+          msbuild GLTFMaya.sln `
+            /m `
+            /restore `
+            /p:Configuration=$env:BUILD_CONFIGURATION `
+            /p:Platform=$env:BUILD_PLATFORM `
+            /p:MAYA_ROOT="$env:MAYA_ROOT" `
+            /p:WindowsTargetPlatformVersion=10.0
+
+      - name: Upload plug-in artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: GLTFMaya-Maya${{ matrix.maya_version }}-${{ env.BUILD_CONFIGURATION }}
+          path: bin/${{ env.BUILD_CONFIGURATION }}/GLTFMaya.mll
+          if-no-files-found: error
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: windows-2022
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: release-artifacts
+
+      - name: Prepare release assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+
+          $plugins = Get-ChildItem -Path release-artifacts -Recurse -File -Filter GLTFMaya.mll
+          if (-not $plugins) {
+            throw "No GLTFMaya.mll files were downloaded from the build jobs."
+          }
+
+          foreach ($plugin in $plugins) {
+            $artifactName = $plugin.Directory.Name
+            $assetRoot = Join-Path $env:RUNNER_TEMP $artifactName
+            $assetPath = Join-Path "release-assets" "$artifactName.zip"
+
+            Remove-Item -Path $assetRoot -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force -Path $assetRoot | Out-Null
+
+            Copy-Item -Path $plugin.FullName -Destination (Join-Path $assetRoot "GLTFMaya.mll") -Force
+
+            Compress-Archive -Path (Join-Path $assetRoot "*") -DestinationPath $assetPath -Force
+          }
+
+      - name: Choose release tag
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            $tag = $env:GITHUB_REF_NAME
+          } else {
+            $tag = "build-$env:GITHUB_RUN_NUMBER"
+          }
+
+          "RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RELEASE_NAME=GLTFMaya $tag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assets = @(Get-ChildItem -Path release-assets -File | ForEach-Object { $_.FullName })
+          if (-not $assets) {
+            throw "No release assets were prepared."
+          }
+
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:RELEASE_TAG @assets --repo $env:GITHUB_REPOSITORY --clobber
+          } else {
+            gh release create $env:RELEASE_TAG @assets --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title $env:RELEASE_NAME --notes "Automated build artifacts from $env:GITHUB_SHA."
+          }

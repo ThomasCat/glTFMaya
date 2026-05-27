@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="src">
+      <UniqueIdentifier>{1a000000-0000-0000-0000-000000000001}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\io">
+      <UniqueIdentifier>{1a000000-0000-0000-0000-000000000002}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\formats">
+      <UniqueIdentifier>{1a000000-0000-0000-0000-000000000003}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\scene">
+      <UniqueIdentifier>{1a000000-0000-0000-0000-000000000004}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\translators">
+      <UniqueIdentifier>{1a000000-0000-0000-0000-000000000005}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\ir">
+      <UniqueIdentifier>{1b000000-0000-0000-0000-000000000003}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\plugin.cpp">
+      <Filter>src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\io\Json.cpp">
+      <Filter>src\io</Filter>
+    </ClCompile>
+    <ClCompile Include="src\formats\GltfFormat.cpp">
+      <Filter>src\formats</Filter>
+    </ClCompile>
+    <ClCompile Include="src\scene\MayaScene.cpp">
+      <Filter>src\scene</Filter>
+    </ClCompile>
+    <ClCompile Include="src\translators\GltfFileTranslator.cpp">
+      <Filter>src\translators</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="include\ir\GltfIr.h">
+      <Filter>src\ir</Filter>
+    </ClInclude>
+    <ClInclude Include="include\formats\GltfFormat.h">
+      <Filter>src\formats</Filter>
+    </ClInclude>
+    <ClInclude Include="include\io\Json.h">
+      <Filter>src\io</Filter>
+    </ClInclude>
+    <ClInclude Include="include\scene\MayaScene.h">
+      <Filter>src\scene</Filter>
+    </ClInclude>
+    <ClInclude Include="include\translators\GltfFileTranslator.h">
+      <Filter>src\translators</Filter>
+    </ClInclude>
+  </ItemGroup>
+</Project>
