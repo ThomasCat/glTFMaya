@@ -40,6 +40,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <functional>
+#include <map>
 #include <set>
 #include <sstream>
 #include <unordered_map>
@@ -135,6 +137,373 @@ MObject findSkinCluster(const MDagPath& meshDag) {
     MItDependencyGraph it(shape, MFn::kSkinClusterFilter, MItDependencyGraph::kUpstream,
                           MItDependencyGraph::kDepthFirst, MItDependencyGraph::kNodeLevel);
     return it.isDone() ? MObject::kNullObj : it.currentItem();
+}
+
+// -- Global transform / combine-mesh IR passes ---------------------------
+
+struct GlobalXform {
+    MMatrix M;        // full row-vector transform: p' = p * M  (scale then rotate)
+    MMatrix R;        // rotation-only component (for normals)
+    bool identity  = true;
+    bool hasScale  = false;  // any globalScale component != 1
+    bool hasRotate = false;  // any globalRotateDeg component != 0
+};
+
+GlobalXform buildGlobalXform(const SceneOptions& opts) {
+    GlobalXform g;
+    g.hasScale  = !(opts.globalScale[0] == 1.0 && opts.globalScale[1] == 1.0 &&
+                    opts.globalScale[2] == 1.0);
+    g.hasRotate = !(opts.globalRotateDeg[0] == 0.0 && opts.globalRotateDeg[1] == 0.0 &&
+                    opts.globalRotateDeg[2] == 0.0);
+    g.identity  = !g.hasScale && !g.hasRotate;
+    if (g.identity) {
+        g.M.setToIdentity();
+        g.R.setToIdentity();
+        return g;
+    }
+    const double deg2rad = 3.14159265358979323846 / 180.0;
+    MEulerRotation e(opts.globalRotateDeg[0] * deg2rad,
+                     opts.globalRotateDeg[1] * deg2rad,
+                     opts.globalRotateDeg[2] * deg2rad,
+                     MEulerRotation::kXYZ);
+    g.R = e.asMatrix();
+    MMatrix S;
+    S.setToIdentity();
+    S(0, 0) = opts.globalScale[0];
+    S(1, 1) = opts.globalScale[1];
+    S(2, 2) = opts.globalScale[2];
+    // Row-vector convention: p' = p * S * R applies scale before rotation.
+    g.M = S * g.R;
+    return g;
+}
+
+// Apply the global scale/rotate to a complete IR document.
+//
+// Scale  — applied to vertex positions AND to the translation component of
+//          every joint's local transform (rotation and scale components are
+//          left unchanged, so root bones carry no extra TRS from this option).
+//          This mirrors CoDMayaTools, which multiplies both vertex world
+//          positions and joint world translations by the same factor.
+//          Inverse-bind matrices and animation translation channels are
+//          rescaled to remain consistent with the new joint positions.
+// Rotate — applied only to vertex positions and normals. Joint transforms,
+//          inverse-bind matrices, and animation channels are not touched —
+//          the user wants the skeleton to stay in Maya's coordinate system
+//          ("treat it like changing the up axis of an object"), and the
+//          game engine refuses non-identity rotations on root bones anyway.
+//
+// Skinning correctness:
+//   Uniform scale (sx==sy==sz==s): exact at every pose — scaling all joint
+//     local translations by s scales every world-space joint position by s,
+//     so the entire deformed mesh comes out scaled by s with no distortion.
+//   Non-uniform scale or rotation: bind pose is correct; non-bind poses may
+//     show some distortion. Same trade-off CoDMayaTools accepts.
+void applyGlobalTransform(ir::Document& doc, const SceneOptions& opts) {
+    GlobalXform g = buildGlobalXform(opts);
+    if (g.identity) return;
+
+    // 1. Vertex positions (full M) and normals (rotation only).
+    for (auto& mesh : doc.meshes) {
+        for (auto& prim : mesh.primitives) {
+            for (auto& v : prim.vertices) {
+                MPoint p(v.position[0], v.position[1], v.position[2]);
+                p = p * g.M;
+                v.position = {p.x, p.y, p.z};
+                if (v.hasNormal) {
+                    MVector n(v.normal[0], v.normal[1], v.normal[2]);
+                    n = n * g.R;
+                    if (n.length() > 1e-12) n.normalize();
+                    v.normal = {n.x, n.y, n.z};
+                }
+            }
+        }
+    }
+
+    // Rotation never touches the skeleton — only scale does.
+    if (!g.hasScale) return;
+
+    // 2. Scale the translation component of every joint's local transform.
+    // For uniform scale this scales every joint's world position by s; for
+    // non-uniform scale it is correct for roots and approximate for children.
+    // Rotation and scale components are deliberately left unchanged so the
+    // joint's local TRS carries no residual from the global-transform option.
+    const size_t nodeCount = doc.nodes.size();
+    for (size_t i = 0; i < nodeCount; ++i) {
+        ir::Node& n = doc.nodes[i];
+        if (!n.isJoint) continue;
+        n.local.translation[0] *= opts.globalScale[0];
+        n.local.translation[1] *= opts.globalScale[1];
+        n.local.translation[2] *= opts.globalScale[2];
+    }
+
+    // 3. Recompute inverse-bind matrices from the new joint world matrices.
+    // The IB is by definition the inverse of the joint's bind-pose world
+    // matrix; since we just moved the joints we have to refresh it or the
+    // bind pose will look wrong in the importer / game engine.
+    std::vector<MMatrix> world(nodeCount);
+    MMatrix I;
+    I.setToIdentity();
+    std::function<void(int, const MMatrix&)> walk = [&](int idx, const MMatrix& parentWorld) {
+        if (idx < 0 || idx >= int(nodeCount)) return;
+        const ir::Node& n = doc.nodes[idx];
+        MTransformationMatrix tm;
+        tm.setTranslation(MVector(n.local.translation[0], n.local.translation[1],
+                                  n.local.translation[2]),
+                          MSpace::kTransform);
+        MQuaternion q(n.local.rotation.x, n.local.rotation.y, n.local.rotation.z,
+                      n.local.rotation.w);
+        tm.setRotationQuaternion(q.x, q.y, q.z, q.w);
+        double s[3] = {n.local.scale[0], n.local.scale[1], n.local.scale[2]};
+        tm.setScale(s, MSpace::kTransform);
+        MMatrix L = tm.asMatrix();
+        world[idx] = L * parentWorld;
+        for (int c : n.children) walk(c, world[idx]);
+    };
+    for (size_t i = 0; i < nodeCount; ++i) {
+        if (doc.nodes[i].parent < 0) walk(int(i), I);
+    }
+    for (auto& skin : doc.skins) {
+        if (skin.inverseBind.size() != skin.joints.size()) continue;
+        for (size_t j = 0; j < skin.joints.size(); ++j) {
+            int nodeIdx = skin.joints[j];
+            if (nodeIdx < 0 || nodeIdx >= int(nodeCount)) continue;
+            MMatrix newIb = world[nodeIdx].inverse();
+            ir::Mat4& ib = skin.inverseBind[j];
+            for (int r = 0; r < 4; ++r)
+                for (int c = 0; c < 4; ++c) ib[r * 4 + c] = newIb(r, c);
+        }
+    }
+
+    // 4. Animation translation channels on joints: scale by S. Rotation and
+    // scale channels are untouched — they're already in joint-local space and
+    // the joint's local rotation/scale isn't changing.
+    for (auto& anim : doc.animations) {
+        for (auto& channel : anim.channels) {
+            if (channel.path != ir::AnimPath::Translation) continue;
+            if (channel.node < 0 || channel.node >= int(nodeCount)) continue;
+            if (!doc.nodes[channel.node].isJoint) continue;
+            if (channel.sampler < 0 || channel.sampler >= int(anim.samplers.size())) continue;
+            auto& sampler = anim.samplers[channel.sampler];
+            int group = 3;
+            int offset = 0;
+            if (sampler.interpolation == ir::AnimInterp::CubicSpline) {
+                group = 9;
+                offset = 3;
+            }
+            const int keys = int(sampler.input.size());
+            for (int k = 0; k < keys; ++k) {
+                double* out = sampler.output.data() + size_t(k) * group + offset;
+                out[0] *= opts.globalScale[0];
+                out[1] *= opts.globalScale[1];
+                out[2] *= opts.globalScale[2];
+            }
+        }
+    }
+}
+
+// Rewrites every node reference in the document after a subset of nodes is
+// removed. `remap` maps old index -> new index, with -1 marking a deleted node.
+void remapNodeIndices(ir::Document& doc, const std::vector<int>& remap) {
+    auto fix = [&](int& idx) {
+        if (idx < 0 || idx >= int(remap.size())) { idx = -1; return; }
+        idx = remap[idx];
+    };
+    for (auto& n : doc.nodes) {
+        fix(n.parent);
+        std::vector<int> kept;
+        kept.reserve(n.children.size());
+        for (int c : n.children) {
+            int m = (c >= 0 && c < int(remap.size())) ? remap[c] : -1;
+            if (m >= 0) kept.push_back(m);
+        }
+        n.children = std::move(kept);
+    }
+    for (auto& s : doc.skins) {
+        for (auto& j : s.joints) fix(j);
+        fix(s.skeleton);
+    }
+    for (auto& a : doc.animations) {
+        std::vector<ir::AnimChannel> kept;
+        kept.reserve(a.channels.size());
+        for (auto& ch : a.channels) {
+            int n = (ch.node >= 0 && ch.node < int(remap.size())) ? remap[ch.node] : -1;
+            if (n < 0) continue;
+            ch.node = n;
+            kept.push_back(ch);
+        }
+        a.channels = std::move(kept);
+    }
+    std::vector<int> roots;
+    roots.reserve(doc.sceneRoots.size());
+    for (int r : doc.sceneRoots) {
+        int m = (r >= 0 && r < int(remap.size())) ? remap[r] : -1;
+        if (m >= 0) roots.push_back(m);
+    }
+    doc.sceneRoots = std::move(roots);
+}
+
+// Removes the given node indices and compacts the node array.
+void removeNodes(ir::Document& doc, const std::unordered_set<int>& victims) {
+    if (victims.empty()) return;
+    std::vector<int> remap(doc.nodes.size(), -1);
+    std::vector<ir::Node> kept;
+    kept.reserve(doc.nodes.size() - victims.size());
+    for (size_t i = 0; i < doc.nodes.size(); ++i) {
+        if (victims.count(int(i))) continue;
+        remap[i] = int(kept.size());
+        kept.push_back(std::move(doc.nodes[i]));
+    }
+    doc.nodes = std::move(kept);
+    remapNodeIndices(doc, remap);
+}
+
+// Collapse every mesh-bearing node down to a single mesh holding the
+// concatenated primitives. Per-primitive material indices are preserved so
+// multi-material assignments survive the merge. Skins are not remapped: when
+// multiple distinct skins exist we keep the first and warn — the typical use
+// case is several rigid props or one rigged character, not many rigs.
+void combineMeshesPass(ir::Document& doc) {
+    if (doc.meshes.size() <= 1) {
+        int meshNodeCount = 0;
+        for (const auto& n : doc.nodes)
+            if (n.mesh >= 0) ++meshNodeCount;
+        if (meshNodeCount <= 1) return;
+    }
+
+    // mesh index -> skin index used by the node that holds that mesh.
+    std::vector<int> meshNodes;
+    std::unordered_map<int, int> meshToSkin;
+    for (size_t i = 0; i < doc.nodes.size(); ++i) {
+        if (doc.nodes[i].mesh < 0) continue;
+        meshNodes.push_back(int(i));
+        meshToSkin.emplace(doc.nodes[i].mesh, doc.nodes[i].skin);
+    }
+    if (meshNodes.empty()) return;
+
+    // Build a master union skin: every unique joint that appears in any of the
+    // source skins gets one slot. perSkinRemap[oldSkin][oldSlot] -> masterSlot
+    // is how we translate a primitive's vertex joint indices when we merge it
+    // into the combined mesh. The inverse-bind matrix for a joint is taken
+    // from whichever source skin first introduces it — if two skins disagree
+    // on a shared joint's IB the binding is inherently ambiguous and the
+    // user's rig would have rendered inconsistently to begin with.
+    ir::Skin master;
+    master.name = "combined";
+    std::unordered_map<int, int> nodeToMasterSlot;
+    std::vector<std::vector<int>> perSkinRemap(doc.skins.size());
+    for (size_t s = 0; s < doc.skins.size(); ++s) {
+        const ir::Skin& src = doc.skins[s];
+        perSkinRemap[s].assign(src.joints.size(), -1);
+        for (size_t j = 0; j < src.joints.size(); ++j) {
+            int node = src.joints[j];
+            int slot;
+            auto it = nodeToMasterSlot.find(node);
+            if (it == nodeToMasterSlot.end()) {
+                slot = int(master.joints.size());
+                nodeToMasterSlot[node] = slot;
+                master.joints.push_back(node);
+                if (j < src.inverseBind.size())
+                    master.inverseBind.push_back(src.inverseBind[j]);
+            } else {
+                slot = it->second;
+            }
+            perSkinRemap[s][j] = slot;
+        }
+    }
+    // inverseBind must stay parallel to joints. If any source skin lacked an
+    // IB at the slot that introduced a joint, fill it with identity.
+    if (!master.inverseBind.empty() && master.inverseBind.size() < master.joints.size()) {
+        ir::Mat4 ident{};
+        ident[0] = ident[5] = ident[10] = ident[15] = 1.0;
+        master.inverseBind.resize(master.joints.size(), ident);
+    }
+
+    // Concatenate primitives, remapping each vertex's per-skin joint slots
+    // through perSkinRemap of its source mesh's skin so the merged primitive
+    // can index a single (master) joint list.
+    ir::Mesh combined;
+    combined.name = "combined";
+    for (size_t m = 0; m < doc.meshes.size(); ++m) {
+        int srcSkin = -1;
+        auto it = meshToSkin.find(int(m));
+        if (it != meshToSkin.end()) srcSkin = it->second;
+        const bool haveRemap = srcSkin >= 0 && srcSkin < int(perSkinRemap.size()) &&
+                               !perSkinRemap[srcSkin].empty();
+        for (auto prim : doc.meshes[m].primitives) {
+            if (haveRemap) {
+                const auto& remap = perSkinRemap[srcSkin];
+                for (auto& v : prim.vertices) {
+                    if (!v.hasSkin) continue;
+                    for (int k = 0; k < 4; ++k) {
+                        if (v.weights[k] <= 0.0) { v.joints[k] = 0; continue; }
+                        int old = v.joints[k];
+                        if (old >= 0 && old < int(remap.size()) && remap[old] >= 0) {
+                            v.joints[k] = remap[old];
+                        } else {
+                            v.joints[k] = 0;
+                            v.weights[k] = 0.0;
+                        }
+                    }
+                }
+            }
+            combined.primitives.push_back(std::move(prim));
+        }
+    }
+
+    doc.meshes.clear();
+    doc.meshes.push_back(std::move(combined));
+
+    // Replace the source skins with the single master skin (or no skin at all
+    // if nothing was skinned).
+    int masterSkinIdx = -1;
+    doc.skins.clear();
+    if (!master.joints.empty()) {
+        masterSkinIdx = 0;
+        doc.skins.push_back(std::move(master));
+    }
+
+    bool kept = false;
+    for (int ni : meshNodes) {
+        if (!kept) {
+            doc.nodes[ni].mesh = 0;
+            doc.nodes[ni].skin = masterSkinIdx;
+            // Verts are bindpose world-space and the merged mesh sits at the
+            // scene root; identity local + no parent means nothing else
+            // sneaks an extra transform into the skinning math.
+            doc.nodes[ni].local = ir::Transform{};
+            doc.nodes[ni].parent = -1;
+            doc.nodes[ni].name = "combined";
+            kept = true;
+        } else {
+            doc.nodes[ni].mesh = -1;
+            doc.nodes[ni].skin = -1;
+        }
+    }
+
+    // The orphan transforms only existed to carry their (now merged) mesh; if
+    // nothing else references them they would still serialize as stray
+    // transform nodes alongside the combined mesh. Walk the doc and drop any
+    // node that has no remaining purpose. Iterate until stable so chains of
+    // parent-only nodes collapse cleanly.
+    auto referenced = [&](int idx) {
+        for (const auto& s : doc.skins)
+            for (int j : s.joints) if (j == idx) return true;
+        for (const auto& a : doc.animations)
+            for (const auto& c : a.channels) if (c.node == idx) return true;
+        return false;
+    };
+    while (true) {
+        std::unordered_set<int> remove;
+        for (size_t i = 0; i < doc.nodes.size(); ++i) {
+            const ir::Node& n = doc.nodes[i];
+            if (n.mesh >= 0 || n.skin >= 0 || n.isJoint) continue;
+            if (!n.children.empty()) continue;
+            if (referenced(int(i))) continue;
+            remove.insert(int(i));
+        }
+        if (remove.empty()) break;
+        removeNodes(doc, remove);
+    }
 }
 
 MObject componentForAllVertices(int count) {
@@ -600,8 +969,9 @@ class Exporter {
 public:
     using NodeSet = std::unordered_set<unsigned int>;
 
-    MStatus run(ir::Document& doc, bool exportAnimation, bool exportSelected,
+    MStatus run(ir::Document& doc, const SceneOptions& opts, bool exportSelected,
                 std::string& error) const {
+        const bool exportAnimation = opts.exportAnimation;
         doc = ir::Document{};
 
         // When exporting the active selection, restrict traversal to the
@@ -642,14 +1012,18 @@ public:
             error = "Nothing to export: no joints or meshes found.";
             return MS::kFailure;
         }
+
+        if (opts.combineMeshes) combineMeshesPass(doc);
+        applyGlobalTransform(doc, opts);
         return MS::kSuccess;
     }
 
 private:
-    // Collects the active selection plus every descendant into a node-hash set.
-    // Also pulls in the influence joints (and their joint-parent chains) of any
-    // selected skinned mesh, so a selected mesh still exports with a complete,
-    // connected skeleton even when the joints themselves weren't selected.
+    // Restricts the export to the active selection plus every descendant. The
+    // selection is taken at face value: if a selected mesh is skinned to joints
+    // outside the selection, those joints are NOT silently pulled in, and the
+    // mesh exports as-is with whatever subset of its influences the user picked.
+    // This matches "Export Selection" semantics — what you select is what you get.
     bool buildSelectionFilter(NodeSet& allowed) const {
         MSelectionList sel;
         MGlobal::getActiveSelectionList(sel);
@@ -664,26 +1038,7 @@ private:
                     allowed.insert(MObjectHandle(p.node()).hashCode());
             }
         }
-        if (allowed.empty()) return false;
-
-        MItDag meshIt(MItDag::kDepthFirst, MFn::kMesh);
-        for (; !meshIt.isDone(); meshIt.next()) {
-            MDagPath dag;
-            if (meshIt.getPath(dag) != MS::kSuccess) continue;
-            if (!allowed.count(MObjectHandle(dag.node()).hashCode())) continue;
-            MObject skinObj = findSkinCluster(dag);
-            if (skinObj.isNull()) continue;
-            MDagPathArray infl;
-            MFnSkinCluster(skinObj).influenceObjects(infl);
-            for (unsigned i = 0; i < infl.length(); ++i) {
-                MDagPath j = infl[i];
-                while (j.length() > 0 && j.hasFn(MFn::kJoint)) {
-                    allowed.insert(MObjectHandle(j.node()).hashCode());
-                    if (j.pop() != MS::kSuccess) break;
-                }
-            }
-        }
-        return true;
+        return !allowed.empty();
     }
 
     void collectJoints(std::vector<MDagPath>& joints,
@@ -776,18 +1131,29 @@ private:
             if (dagFn.isIntermediateObject()) continue;
             if (!seen.insert(MObjectHandle(dag.node()).hashCode()).second) continue;
 
+            // Prefer the transform's name over the shape's name: in Maya the
+            // transform is what the user named (e.g. "CastMesh21") while the
+            // shape underneath usually shares a generic suffix like
+            // "CastShape" across many meshes — non-unique and useless for
+            // round-tripping or matching back to the source asset.
+            MDagPath xformPath = dag;
+            std::string displayName = shortName(dagFn.partialPathName());
+            if (xformPath.pop() == MS::kSuccess && xformPath.length() > 0) {
+                displayName = shortName(MFnDagNode(xformPath).partialPathName());
+            }
+
             ir::Mesh mesh;
-            mesh.name = shortName(dagFn.partialPathName());
-            ir::Primitive prim;
-            int skinIndex = buildPrimitive(dag, jointNodeIndex, prim, doc);
-            if (prim.vertices.empty()) continue;
-            mesh.primitives.push_back(std::move(prim));
+            mesh.name = displayName;
+            std::vector<ir::Primitive> prims;
+            int skinIndex = buildPrimitives(dag, jointNodeIndex, prims, doc);
+            if (prims.empty()) continue;
+            for (auto& p : prims) mesh.primitives.push_back(std::move(p));
 
             int meshIndex = int(doc.meshes.size());
             doc.meshes.push_back(std::move(mesh));
 
             ir::Node node;
-            node.name = shortName(dagFn.partialPathName());
+            node.name = displayName;
             node.mesh = meshIndex;
             node.skin = skinIndex;
             doc.nodes.push_back(std::move(node));
@@ -855,9 +1221,9 @@ private:
         return outputShape;
     }
 
-    int buildPrimitive(const MDagPath& dag,
-                       const std::unordered_map<unsigned int, int>& jointNodeIndex,
-                       ir::Primitive& prim, ir::Document& doc) const {
+    int buildPrimitives(const MDagPath& dag,
+                        const std::unordered_map<unsigned int, int>& jointNodeIndex,
+                        std::vector<ir::Primitive>& outPrims, ir::Document& doc) const {
         MObject skinObj = findSkinCluster(dag);
         MFnSkinCluster skin;
         MDagPathArray influences;
@@ -866,54 +1232,171 @@ private:
         if (!skinObj.isNull())
             skinIndex = buildSkin(skinObj, skin, influences, influenceSlot, jointNodeIndex, doc);
 
-        MDagPath geomDag = skinObj.isNull() ? dag : geometrySource(dag);
-        MFnMesh fnMesh(geomDag);
+        // Read geometry from the OUTPUT shape (the user-visible mesh) — not
+        // the intermediate `Orig` — and recover bindpose positions by
+        // inverting the per-vertex skin matrix. This is robust against any
+        // deformer chain between Orig and output (deleteComponent nodes that
+        // strip verts, blendShapes, etc.); reading Orig directly desyncs from
+        // the skin's weight table the moment topology differs between the
+        // two, which manifests as wholesale mesh-positioning bugs.
+        MFnMesh fnMesh(dag);
         const int numVertices = fnMesh.numVertices();
+        MPointArray points;
+        fnMesh.getPoints(points, MSpace::kWorld);
 
-        // Material per face: capture connected shaders for primitive material 0.
+        // Precompute each influence's current "skin matrix" = bindPreMatrix *
+        // jointWorldMatrix. The combined per-vertex transform is the weighted
+        // sum of these; we invert it per vertex to undo the skinning and get
+        // the bindpose world position the renderer will re-skin from.
+        std::vector<MMatrix> influenceSkin;
+        if (skinIndex >= 0) {
+            MPlug bindPre = MFnDependencyNode(skinObj).findPlug("bindPreMatrix", false);
+            influenceSkin.reserve(influences.length());
+            for (unsigned i = 0; i < influences.length(); ++i) {
+                unsigned logical = skin.indexForInfluenceObject(influences[i]);
+                MPlug elem = bindPre.elementByLogicalIndex(logical);
+                MObject data = elem.asMObject();
+                MMatrix bpm;
+                if (!data.isNull()) bpm = MFnMatrixData(data).matrix();
+                else bpm = influences[i].inclusiveMatrixInverse();
+                influenceSkin.push_back(bpm * influences[i].inclusiveMatrix());
+            }
+        }
+
+        std::vector<ir::Vertex> masterVerts(numVertices);
+        for (int v = 0; v < numVertices; ++v) {
+            MPoint pCurrent = points[v];
+            MPoint pBind = pCurrent;
+            if (skinIndex >= 0) {
+                MFnSingleIndexedComponent compFn;
+                MObject comp = compFn.create(MFn::kMeshVertComponent);
+                compFn.addElement(v);
+                MDoubleArray ws;
+                unsigned ic = 0;
+                skin.getWeights(dag, comp, ws, ic);
+                MMatrix combined;
+                for (int r = 0; r < 4; ++r)
+                    for (int c = 0; c < 4; ++c) combined(r, c) = 0.0;
+                double wsum = 0.0;
+                for (unsigned i = 0; i < ws.length() && i < influenceSkin.size(); ++i) {
+                    if (ws[i] <= 0.0) continue;
+                    const MMatrix& M = influenceSkin[i];
+                    for (int r = 0; r < 4; ++r)
+                        for (int c = 0; c < 4; ++c) combined(r, c) += ws[i] * M(r, c);
+                    wsum += ws[i];
+                }
+                if (wsum > 1e-9) pBind = pCurrent * combined.inverse();
+                applyVertexWeights(skin, dag, influences, influenceSlot, v, masterVerts[v]);
+            }
+            masterVerts[v].position = {pBind.x, pBind.y, pBind.z};
+        }
+
+        // shaderIndices[f] indexes into shaders[] for face f (-1 unassigned).
+        // We split per shader, but only when more than one shader actually
+        // contributes — preserving the original 1:1 vertex order in the
+        // common single-material case keeps downstream consumers (and the
+        // round-trip test's index-pairing) stable.
         MObjectArray shaders;
         MIntArray shaderIndices;
         MFnMesh(dag).getConnectedShaders(dag.instanceNumber(), shaders, shaderIndices);
-        prim.material = registerMaterial(shaders, doc);
 
-        // Read geometry in world space. The exported mesh node is identity and
-        // glTF skinning ignores the mesh node transform, so bind-world positions
-        // are what `jointGlobal * inverseBind * position` must consume — and for
-        // unskinned meshes world space keeps them where the scene places them.
-        prim.vertices.resize(numVertices);
-        MPointArray points;
-        fnMesh.getPoints(points, MSpace::kWorld);
-        for (int v = 0; v < numVertices; ++v) {
-            ir::Vertex& vert = prim.vertices[v];
-            vert.position = {points[v].x, points[v].y, points[v].z};
-            if (skinIndex >= 0) applyVertexWeights(skin, dag, influences, influenceSlot, v, vert);
-        }
+        std::set<int> usedShaders;
+        for (unsigned f = 0; f < shaderIndices.length(); ++f) usedShaders.insert(shaderIndices[f]);
+        const bool multiMaterial = usedShaders.size() > 1;
 
-        // Normals and UVs are stored per face-vertex in Maya. The source asset
-        // pre-split vertices at hard edges and UV seams, so each vertex carries
-        // a single consistent corner value; read it per corner rather than the
-        // averaged per-vertex normal, which would blend across those splits.
-        MItMeshPolygon poly(geomDag);
-        for (; !poly.isDone(); poly.next()) {
+        // First pass: populate per-master normals and UVs. (Source assets
+        // pre-split vertices at hard edges and UV seams, so each master vertex
+        // sees a single consistent corner value across its incident faces.)
+        std::vector<int> faceShader;
+        std::vector<std::vector<int>> faceTris;
+        faceShader.reserve(shaderIndices.length());
+        faceTris.reserve(shaderIndices.length());
+        // Iterate the OUTPUT shape's polygons too — Orig may have different
+        // topology when a deleteComponent (or any topology-changing deformer)
+        // sits between Orig and the user-visible mesh. Reading polygon data
+        // from `dag` keeps face/vert indices consistent with the positions
+        // and skin weights we just collected.
+        MItMeshPolygon poly(dag);
+        int faceIndex = 0;
+        for (; !poly.isDone(); poly.next(), ++faceIndex) {
             MIntArray faceVerts;
             poly.getVertices(faceVerts);
             for (unsigned c = 0; c < faceVerts.length(); ++c) {
                 int vid = faceVerts[c];
                 MVector n;
                 poly.getNormal(c, n, MSpace::kWorld);
-                prim.vertices[vid].normal = {n.x, n.y, n.z};
-                prim.vertices[vid].hasNormal = true;
+                masterVerts[vid].normal = {n.x, n.y, n.z};
+                masterVerts[vid].hasNormal = true;
                 if (poly.hasUVs()) {
                     float2 uv{0.0f, 0.0f};
                     poly.getUV(c, uv);
-                    prim.vertices[vid].uv = {uv[0], 1.0 - uv[1]};
-                    prim.vertices[vid].hasUv = true;
+                    masterVerts[vid].uv = {uv[0], 1.0 - uv[1]};
+                    masterVerts[vid].hasUv = true;
                 }
             }
             MIntArray triVerts;
             MPointArray triPoints;
             poly.getTriangles(triPoints, triVerts);
-            for (unsigned i = 0; i < triVerts.length(); ++i) prim.indices.push_back(triVerts[i]);
+            std::vector<int> tris;
+            tris.reserve(triVerts.length());
+            for (unsigned i = 0; i < triVerts.length(); ++i) tris.push_back(triVerts[i]);
+            faceTris.push_back(std::move(tris));
+            faceShader.push_back(faceIndex < int(shaderIndices.length()) ? shaderIndices[faceIndex]
+                                                                          : -1);
+        }
+
+        if (!multiMaterial) {
+            // Fast path preserves master vertex ordering 1:1.
+            ir::Primitive prim;
+            prim.vertices = std::move(masterVerts);
+            for (const auto& tris : faceTris)
+                for (int v : tris) prim.indices.push_back(v);
+            prim.material = registerMaterial(shaders, doc);
+            if (!prim.vertices.empty() && !prim.indices.empty()) outPrims.push_back(std::move(prim));
+            return skinIndex;
+        }
+
+        // Multi-material split: one primitive per shader group, vertices
+        // remapped per group so the primitives are self-contained.
+        std::map<int, ir::Primitive> groups; // ordered: assigned first, -1 last
+        std::map<int, std::unordered_map<int, int>> remap;
+        for (size_t f = 0; f < faceTris.size(); ++f) {
+            int s = faceShader[f];
+            auto pit = groups.find(s);
+            if (pit == groups.end()) {
+                ir::Primitive empty;
+                MObjectArray one;
+                if (s >= 0 && s < int(shaders.length())) one.append(shaders[s]);
+                empty.material = registerMaterial(one, doc);
+                pit = groups.emplace(s, std::move(empty)).first;
+                remap.emplace(s, std::unordered_map<int, int>{});
+            }
+            ir::Primitive& prim = pit->second;
+            auto& rmap = remap[s];
+            for (int masterVid : faceTris[f]) {
+                auto rit = rmap.find(masterVid);
+                int localVid;
+                if (rit == rmap.end()) {
+                    localVid = int(prim.vertices.size());
+                    rmap.emplace(masterVid, localVid);
+                    prim.vertices.push_back(masterVerts[masterVid]);
+                } else {
+                    localVid = rit->second;
+                }
+                prim.indices.push_back(localVid);
+            }
+        }
+
+        // Emit in key order with -1 (unassigned) last.
+        for (auto& [s, prim] : groups) {
+            if (s < 0) continue;
+            if (prim.vertices.empty() || prim.indices.empty()) continue;
+            outPrims.push_back(std::move(prim));
+        }
+        auto unassigned = groups.find(-1);
+        if (unassigned != groups.end() && !unassigned->second.vertices.empty() &&
+            !unassigned->second.indices.empty()) {
+            outPrims.push_back(std::move(unassigned->second));
         }
         return skinIndex;
     }
@@ -1028,15 +1511,21 @@ private:
 
 } // namespace
 
-MStatus MayaScene::importDocument(const ir::Document& doc) {
-    Importer importer(doc);
+MStatus MayaScene::importDocument(const ir::Document& doc, const SceneOptions& opts) {
+    // Bake the user-requested global transform and mesh combine into the IR
+    // before instantiating any Maya nodes, so the Importer stays unaware of
+    // these options and the created scene carries no residual transforms.
+    ir::Document working = doc;
+    if (opts.combineMeshes) combineMeshesPass(working);
+    applyGlobalTransform(working, opts);
+    Importer importer(working);
     return importer.run();
 }
 
-MStatus MayaScene::exportDocument(ir::Document& doc, bool exportAnimation, bool exportSelected,
+MStatus MayaScene::exportDocument(ir::Document& doc, const SceneOptions& opts, bool exportSelected,
                                   std::string& error) const {
     Exporter exporter;
-    return exporter.run(doc, exportAnimation, exportSelected, error);
+    return exporter.run(doc, opts, exportSelected, error);
 }
 
 } // namespace gltfmaya::scene
